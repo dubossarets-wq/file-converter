@@ -2320,10 +2320,14 @@
     };
   }
 
-  // Single-threaded ffmpeg-core runs in a 32-bit WASM heap (4GB address
-  // space, much less actually usable) — a file above this loads whole into
-  // memory and reliably crashes the engine instead of just failing cleanly.
-  var MAX_VIDEO_INPUT_BYTES = 2 * 1024 * 1024 * 1024;
+  // writeFile() copies the whole input into the WASM heap (32-bit, ~4GB
+  // ceiling) up front — that's what actually crashed on a 5.5GB file, not
+  // the file being "too big" to process in principle. Mounting it as
+  // WORKERFS instead exposes the real File object to ffmpeg for on-demand
+  // reads, so only what's actually being decoded at a given moment sits in
+  // memory. The output written back through MEMFS still has to fit whole,
+  // but a re-encoded file is normally a fraction of the source's size.
+  var MAX_VIDEO_INPUT_BYTES = 10 * 1024 * 1024 * 1024;
 
   async function convertVideoItem(item, settings) {
     item.status = "processing";
@@ -2331,21 +2335,25 @@
 
     if (item.file.size > MAX_VIDEO_INPUT_BYTES) {
       item.status = "error";
-      item.error = "Файл больше 2 ГБ — слишком тяжёлый для конвертации в браузере";
+      item.error = "Файл больше 10 ГБ — слишком тяжёлый для конвертации в браузере";
       renderRow(item);
       updateSummary();
       return;
     }
 
-    var inputName = "in_" + item.id + "_" + item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    var mountDir = "/in_" + item.id;
+    var inputPath = mountDir + "/" + item.file.name;
     var outputName = "out_" + item.id + "." + settings.format;
+    var mounted = false;
     try {
       var ffmpeg = await loadFFmpeg();
-      var data = await window.FFmpegUtil.fetchFile(item.file);
-      await ffmpeg.writeFile(inputName, data);
-      await ffmpeg.exec(videoFfmpegArgs(inputName, outputName, settings));
+      await ffmpeg.createDir(mountDir);
+      await ffmpeg.mount("WORKERFS", { files: [item.file] }, mountDir);
+      mounted = true;
+      await ffmpeg.exec(videoFfmpegArgs(inputPath, outputName, settings));
       var outData = await ffmpeg.readFile(outputName);
-      try { await ffmpeg.deleteFile(inputName); } catch (e) {}
+      try { await ffmpeg.unmount(mountDir); } catch (e) {}
+      try { await ffmpeg.deleteDir(mountDir); } catch (e) {}
       try { await ffmpeg.deleteFile(outputName); } catch (e) {}
 
       var blob = new Blob([outData.buffer], { type: VIDEO_MIME[settings.format] });
@@ -2359,7 +2367,8 @@
     } catch (e) {
       console.error("Video conversion failed:", e);
       item.status = "error";
-      item.error = "Не удалось сконвертировать видео";
+      item.error = "Не удалось сконвертировать видео — файл слишком тяжёлый или неподдерживаемый формат";
+      if (mounted) { try { await ffmpeg.unmount(mountDir); } catch (e2) {} }
       // A crash inside the WASM engine (most often out-of-memory) can leave
       // the shared instance permanently broken — every later conversion
       // would then silently fail the same way, looking like "Применить"
