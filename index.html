@@ -2409,7 +2409,12 @@
     // re-rendering every existing row on each push was O(n²) DOM work for
     // a big batch, which is what made the page feel stuck while adding.
     renderAll();
-    controlsPanel.classList.add("visible");
+    // Each panel only concerns its own file kind — showing the image
+    // settings while only video was dropped (or the reverse) is just
+    // confusing, since none of those controls apply.
+    if (items.some(function (it) { return it.kind !== "video"; })) {
+      controlsPanel.classList.add("visible");
+    }
     tableSection.classList.add("visible");
     summaryBar.classList.add("visible");
   }
@@ -2669,8 +2674,10 @@
     if (!items.some(function (it) { return it.kind === "video"; })) {
       videoControlsPanel.classList.remove("visible");
     }
-    if (!items.length) {
+    if (!items.some(function (it) { return it.kind !== "video"; })) {
       controlsPanel.classList.remove("visible");
+    }
+    if (!items.length) {
       tableSection.classList.remove("visible");
       summaryBar.classList.remove("visible");
     }
