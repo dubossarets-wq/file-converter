@@ -684,6 +684,29 @@
   .chip.bad { background: var(--bad-bg); color: var(--bad); }
   .chip.pending { background: var(--surface-2); color: var(--text-dim); }
 
+  .mini-progress-wrap { min-width: 110px; }
+  .mini-progress {
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+  .mini-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width .3s ease;
+  }
+  .mini-progress-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
   .row-actions {
     display: flex;
     gap: 6px;
@@ -2297,34 +2320,64 @@
     };
   }
 
+  // fetch() has no upload-progress event, so the initial upload (the only
+  // stage where we control byte-level progress) goes through XHR instead.
+  function uploadVideoJob(item, settings) {
+    return new Promise(function (resolve, reject) {
+      var form = new FormData();
+      form.append("file", item.file, item.file.name);
+      form.append("format", settings.format);
+      form.append("quality", String(settings.quality));
+
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", VIDEO_BACKEND_URL + "/jobs");
+      xhr.setRequestHeader("X-Auth-Token", VIDEO_BACKEND_TOKEN);
+      xhr.upload.onprogress = function (e) {
+        if (!e.lengthComputable) return;
+        item.stage = "uploading";
+        item.progress = Math.round((e.loaded / e.total) * 100);
+        renderRow(item);
+      };
+      xhr.onload = function () {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error("upload failed: " + xhr.status));
+          return;
+        }
+        try {
+          resolve(JSON.parse(xhr.responseText).jobId);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      xhr.onerror = function () { reject(new Error("upload network error")); };
+      xhr.send(form);
+    });
+  }
+
   async function convertVideoItem(item, settings) {
     item.status = "processing";
+    item.stage = "uploading";
+    item.progress = 0;
     renderRow(item);
 
     if (item.file.size > MAX_VIDEO_INPUT_BYTES) {
       item.status = "error";
       item.error = "Файл больше 10 ГБ";
+      item.stage = null;
       renderRow(item);
       updateSummary();
       return;
     }
 
     try {
-      var form = new FormData();
-      form.append("file", item.file, item.file.name);
-      form.append("format", settings.format);
-      form.append("quality", String(settings.quality));
-
       // The free Render instance spins down when idle — the first request
       // after a while can take 50+ seconds just to wake it up, on top of
       // the actual upload and transcode time.
-      var startResp = await fetch(VIDEO_BACKEND_URL + "/jobs", {
-        method: "POST",
-        headers: { "X-Auth-Token": VIDEO_BACKEND_TOKEN },
-        body: form
-      });
-      if (!startResp.ok) throw new Error("upload failed: " + startResp.status);
-      var jobId = (await startResp.json()).jobId;
+      var jobId = await uploadVideoJob(item, settings);
+
+      item.stage = "processing";
+      item.progress = 0;
+      renderRow(item);
 
       var status;
       while (true) {
@@ -2334,9 +2387,15 @@
         });
         if (!statusResp.ok) throw new Error("status check failed: " + statusResp.status);
         status = await statusResp.json();
+        item.progress = typeof status.progress === "number" ? status.progress : item.progress;
+        renderRow(item);
         if (status.status === "done" || status.status === "error") break;
       }
       if (status.status === "error") throw new Error(status.error || "conversion failed");
+
+      item.stage = "downloading";
+      item.progress = 100;
+      renderRow(item);
 
       var resultResp = await fetch(VIDEO_BACKEND_URL + "/jobs/" + jobId + "/result", {
         headers: { "X-Auth-Token": VIDEO_BACKEND_TOKEN }
@@ -2349,12 +2408,14 @@
       item.outputFormat = settings.format;
       item.lastVideoSettingsKey = JSON.stringify(settings);
       item.status = "done";
+      item.stage = null;
       renderRow(item);
       updateSummary();
     } catch (e) {
       console.error("Video conversion failed:", e);
       item.status = "error";
       item.error = "Не удалось сконвертировать видео — сервер недоступен или файл повреждён";
+      item.stage = null;
       renderRow(item);
       updateSummary();
     }
@@ -2728,7 +2789,17 @@
 
     if (item.status === "pending" || item.status === "processing") {
       resultCell.textContent = "…";
-      savingsCell.innerHTML = '<span class="chip pending">обработка</span>';
+      if (item.kind === "video" && item.status === "processing" && item.stage) {
+        var stageLabel = item.stage === "uploading" ? "Загрузка" : item.stage === "downloading" ? "Скачивание" : "Обработка";
+        var vpct = Math.max(0, Math.min(100, item.progress || 0));
+        savingsCell.innerHTML =
+          '<div class="mini-progress-wrap">' +
+            '<div class="mini-progress"><div class="mini-progress-fill" style="width:' + vpct + '%"></div></div>' +
+            '<span class="mini-progress-label">' + stageLabel + ' ' + vpct + '%</span>' +
+          '</div>';
+      } else {
+        savingsCell.innerHTML = '<span class="chip pending">обработка</span>';
+      }
     } else if (item.status === "error") {
       resultCell.textContent = "—";
       savingsCell.innerHTML = '<span class="chip bad" title="' + (item.error || "") + '">ошибка</span>';
