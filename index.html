@@ -1406,6 +1406,27 @@
     </div>
   </div>
 
+  <div class="panel" id="videoControlsPanel">
+    <p class="panel-title">Настройки конвертации видео</p>
+    <div class="controls-grid">
+      <div class="field">
+        <label for="videoFormatSelect">Формат на выходе <span class="tip" tabindex="0" data-tip="MP4 (H.264) — самый совместимый вариант, проигрывается везде. WebM (VP9) — легче по весу, но поддерживается не всеми плеерами/монтажными программами."></span></label>
+        <select id="videoFormatSelect">
+          <option value="mp4" selected>MP4 (H.264)</option>
+          <option value="webm">WebM (VP9)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="videoQualitySlider">Качество: <input type="number" class="field-value-input" id="videoQualityValue" min="1" max="100" value="70">% <span class="tip" tabindex="0" data-tip="Выше — лучше картинка, но тяжелее файл. Настройка одна на видео и звук."></span></label>
+        <input type="range" id="videoQualitySlider" min="1" max="100" value="70">
+      </div>
+    </div>
+    <div class="apply-row">
+      <p class="field-note" style="margin:0;">Видео обрабатываются по одному — это может занять время</p>
+      <button class="btn" id="applyVideoBtn">Применить ко всем видео</button>
+    </div>
+  </div>
+
   <div class="table-section" id="tableSection">
     <div class="table-wrap">
       <table class="file-table">
@@ -1615,7 +1636,7 @@
   "use strict";
 
   var FORMAT_MIME = { webp: "image/webp", jpeg: "image/jpeg", png: "image/png" };
-  var FORMAT_EXT = { webp: "webp", jpeg: "jpg", png: "png", mp4: "mp4" };
+  var FORMAT_EXT = { webp: "webp", jpeg: "jpg", png: "png", mp4: "mp4", webm: "webm" };
 
   // ---- Resize kernels (own implementation — the browser only exposes a
   // single "smooth on/off" toggle, not a choice of resampling filters) ----
@@ -1961,6 +1982,11 @@
   var applyAllBtn = document.getElementById("applyAllBtn");
   var cancelApplyBtn = document.getElementById("cancelApplyBtn");
   var concurrencySelect = document.getElementById("concurrencySelect");
+  var videoControlsPanel = document.getElementById("videoControlsPanel");
+  var videoFormatSelect = document.getElementById("videoFormatSelect");
+  var videoQualitySlider = document.getElementById("videoQualitySlider");
+  var videoQualityValue = document.getElementById("videoQualityValue");
+  var applyVideoBtn = document.getElementById("applyVideoBtn");
   var tableSection = document.getElementById("tableSection");
   var fileRows = document.getElementById("fileRows");
   var summaryBar = document.getElementById("summaryBar");
@@ -2273,24 +2299,46 @@
     return ffmpegLoadPromise;
   }
 
-  async function convertVideoItem(item) {
+  var VIDEO_MIME = { mp4: "video/mp4", webm: "video/webm" };
+
+  // Quality 1–100 maps to each codec's own CRF scale (lower CRF = better/
+  // heavier). The two codecs use very different ranges, so the mapping is
+  // per-format rather than a single shared number.
+  function videoFfmpegArgs(inputName, outputName, settings) {
+    if (settings.format === "webm") {
+      var vp9Crf = Math.round(45 - (settings.quality / 100) * 30);
+      return ["-i", inputName, "-c:v", "libvpx-vp9", "-crf", String(vp9Crf), "-b:v", "0", "-c:a", "libopus", outputName];
+    }
+    var x264Crf = Math.round(32 - (settings.quality / 100) * 14);
+    return ["-i", inputName, "-c:v", "libx264", "-preset", "veryfast", "-crf", String(x264Crf), "-c:a", "aac", "-b:a", "128k", outputName];
+  }
+
+  function currentVideoSettings() {
+    return {
+      format: videoFormatSelect.value,
+      quality: parseInt(videoQualitySlider.value, 10)
+    };
+  }
+
+  async function convertVideoItem(item, settings) {
     item.status = "processing";
     renderRow(item);
     var inputName = "in_" + item.id + "_" + item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-    var outputName = "out_" + item.id + ".mp4";
+    var outputName = "out_" + item.id + "." + settings.format;
     try {
       var ffmpeg = await loadFFmpeg();
       var data = await window.FFmpegUtil.fetchFile(item.file);
       await ffmpeg.writeFile(inputName, data);
-      await ffmpeg.exec(["-i", inputName, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", outputName]);
+      await ffmpeg.exec(videoFfmpegArgs(inputName, outputName, settings));
       var outData = await ffmpeg.readFile(outputName);
       try { await ffmpeg.deleteFile(inputName); } catch (e) {}
       try { await ffmpeg.deleteFile(outputName); } catch (e) {}
 
-      var blob = new Blob([outData.buffer], { type: "video/mp4" });
+      var blob = new Blob([outData.buffer], { type: VIDEO_MIME[settings.format] });
       item.outputBlob = blob;
       item.outputSize = blob.size;
-      item.outputFormat = "mp4";
+      item.outputFormat = settings.format;
+      item.lastVideoSettingsKey = JSON.stringify(settings);
       item.status = "done";
       renderRow(item);
       updateSummary();
@@ -2334,7 +2382,8 @@
       items.push(item);
 
       if (kind === "video") {
-        enqueueVideoJob(function () { return convertVideoItem(item); });
+        videoControlsPanel.classList.add("visible");
+        enqueueVideoJob(function () { return convertVideoItem(item, currentVideoSettings()); });
         return;
       }
 
@@ -2617,6 +2666,9 @@
     items = items.filter(function (it) { return it.id !== id; });
     renderAll();
     updateSummary();
+    if (!items.some(function (it) { return it.kind === "video"; })) {
+      videoControlsPanel.classList.remove("visible");
+    }
     if (!items.length) {
       controlsPanel.classList.remove("visible");
       tableSection.classList.remove("visible");
@@ -2843,6 +2895,38 @@
     var v = concurrencySelect.value;
     MAX_CONCURRENT_JOBS = v === "all" ? Infinity : parseInt(v, 10);
     pumpQueue();
+  });
+
+  videoQualitySlider.addEventListener("input", function () {
+    videoQualityValue.value = videoQualitySlider.value;
+  });
+  videoQualityValue.addEventListener("input", function () {
+    var v = parseInt(videoQualityValue.value, 10);
+    if (isNaN(v)) return;
+    videoQualitySlider.value = Math.max(1, Math.min(100, v));
+  });
+  videoQualityValue.addEventListener("blur", function () {
+    videoQualityValue.value = videoQualitySlider.value;
+  });
+
+  applyVideoBtn.addEventListener("click", function () {
+    var settings = currentVideoSettings();
+    var key = JSON.stringify(settings);
+    var pending = items.filter(function (it) {
+      return it.kind === "video" && it.lastVideoSettingsKey !== key;
+    });
+    if (!pending.length) return;
+    var original = applyVideoBtn.textContent;
+    applyVideoBtn.disabled = true;
+    var done = 0;
+    pending.forEach(function (item) {
+      applyVideoBtn.textContent = "Обработка " + done + "/" + pending.length + "…";
+      enqueueVideoJob(function () { return convertVideoItem(item, settings); }).then(function () {
+        done++;
+        applyVideoBtn.textContent = done < pending.length ? "Обработка " + done + "/" + pending.length + "…" : original;
+        if (done >= pending.length) applyVideoBtn.disabled = false;
+      });
+    });
   });
 
   function downloadZip(doneItems) {
