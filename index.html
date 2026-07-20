@@ -1423,7 +1423,7 @@
     </div>
     <div class="apply-row">
       <p class="field-note" style="margin:0;">Видео обрабатываются по одному — это может занять время</p>
-      <button class="btn" id="applyVideoBtn">Применить ко всем видео</button>
+      <button class="btn" id="applyVideoBtn">Применить</button>
     </div>
   </div>
 
@@ -2320,9 +2320,23 @@
     };
   }
 
+  // Single-threaded ffmpeg-core runs in a 32-bit WASM heap (4GB address
+  // space, much less actually usable) — a file above this loads whole into
+  // memory and reliably crashes the engine instead of just failing cleanly.
+  var MAX_VIDEO_INPUT_BYTES = 2 * 1024 * 1024 * 1024;
+
   async function convertVideoItem(item, settings) {
     item.status = "processing";
     renderRow(item);
+
+    if (item.file.size > MAX_VIDEO_INPUT_BYTES) {
+      item.status = "error";
+      item.error = "Файл больше 2 ГБ — слишком тяжёлый для конвертации в браузере";
+      renderRow(item);
+      updateSummary();
+      return;
+    }
+
     var inputName = "in_" + item.id + "_" + item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     var outputName = "out_" + item.id + "." + settings.format;
     try {
@@ -2343,8 +2357,15 @@
       renderRow(item);
       updateSummary();
     } catch (e) {
+      console.error("Video conversion failed:", e);
       item.status = "error";
       item.error = "Не удалось сконвертировать видео";
+      // A crash inside the WASM engine (most often out-of-memory) can leave
+      // the shared instance permanently broken — every later conversion
+      // would then silently fail the same way, looking like "Применить"
+      // does nothing. Force a fresh instance on the next attempt.
+      ffmpegInstance = null;
+      ffmpegLoadPromise = null;
       renderRow(item);
       updateSummary();
     }
@@ -2721,7 +2742,7 @@
       savingsCell.innerHTML = '<span class="chip pending">обработка</span>';
     } else if (item.status === "error") {
       resultCell.textContent = "—";
-      savingsCell.innerHTML = '<span class="chip bad">ошибка</span>';
+      savingsCell.innerHTML = '<span class="chip bad" title="' + (item.error || "") + '">ошибка</span>';
     } else {
       resultCell.textContent = formatBytes(item.outputSize);
       var diff = item.originalSize - item.outputSize;
