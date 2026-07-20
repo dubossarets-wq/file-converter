@@ -3,7 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Конвертер изображений</title>
+<title>Конвертер файлов</title>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
 <style>
   :root {
     --bg: #F6F7F5;
@@ -650,6 +652,9 @@
     background-position: center;
     background-size: 18px 18px;
   }
+  .thumb.thumb-video {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa3a0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='5' width='15' height='14' rx='2'%3E%3C/rect%3E%3Cpath d='M17 9.5l5-3v11l-5-3'%3E%3C/path%3E%3C/svg%3E");
+  }
   .fname { min-width: 0; }
   .fname .name {
     display: block;
@@ -1255,9 +1260,9 @@
 <div class="wrap" id="batchScreen">
   <header class="page-head page-head-row">
     <div>
-      <h1>Конвертер изображений</h1>
-      <p class="subtitle">Пакетная обработка: JPEG / PNG → WebP, с контролем качества и размера</p>
-      <div class="privacy-note"><span class="privacy-dot"></span>Обрабатывается локально, никуда не отправляется</div>
+      <h1>Конвертер файлов</h1>
+      <p class="subtitle">Изображения (JPEG / PNG / WebP / GIF / BMP) и видео (MOV / AVI / MKV → MP4)</p>
+      <div class="privacy-note"><span class="privacy-dot"></span>Файлы обрабатываются локально в браузере и никуда не загружаются (для видео при первом запуске подгружается сам движок конвертации, ~25 МБ)</div>
     </div>
     <button class="btn-ghost btn" id="toSingleBtn">← Один файл</button>
   </header>
@@ -1265,9 +1270,9 @@
   <div class="banner" id="webpBanner">Браузер не поддерживает WebP — переключено на JPEG.</div>
 
   <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Выбрать файлы для конвертации">
-    <div class="dz-title">Перетащите изображения сюда</div>
-    <div class="dz-sub">или нажмите, чтобы выбрать файлы · JPEG, PNG, WebP, GIF, BMP</div>
-    <input type="file" id="fileInput" accept="image/*" multiple>
+    <div class="dz-title">Перетащите файлы сюда</div>
+    <div class="dz-sub">или нажмите, чтобы выбрать файлы · JPEG, PNG, WebP, GIF, BMP, MOV, MP4, AVI, MKV</div>
+    <input type="file" id="fileInput" accept="image/*,video/*,.mkv,.mov,.avi,.wmv,.flv,.3gp" multiple>
   </div>
 
   <div class="panel" id="controlsPanel">
@@ -1449,8 +1454,8 @@
   <div class="compare-empty" id="compareEmptyZone" tabindex="0" role="button" aria-label="Выбрать фото">
     <div class="compare-empty-icon">⇔</div>
     <div class="compare-empty-title">Перетащите фото сюда</div>
-    <div class="compare-empty-sub">или нажмите, чтобы выбрать файл · JPEG, PNG, WebP, GIF, BMP</div>
-    <input type="file" id="compareEmptyInput" accept="image/*" multiple style="display:none;">
+    <div class="compare-empty-sub">или нажмите, чтобы выбрать файл · JPEG, PNG, WebP, GIF, BMP · видео (MOV, MP4, AVI, MKV) уйдёт в массовую обработку</div>
+    <input type="file" id="compareEmptyInput" accept="image/*,video/*,.mkv,.mov,.avi,.wmv,.flv,.3gp" multiple style="display:none;">
   </div>
 
   <div class="compare-main" id="compareMain">
@@ -1610,7 +1615,7 @@
   "use strict";
 
   var FORMAT_MIME = { webp: "image/webp", jpeg: "image/jpeg", png: "image/png" };
-  var FORMAT_EXT = { webp: "webp", jpeg: "jpg", png: "png" };
+  var FORMAT_EXT = { webp: "webp", jpeg: "jpg", png: "png", mp4: "mp4" };
 
   // ---- Resize kernels (own implementation — the browser only exposes a
   // single "smooth on/off" toggle, not a choice of resampling filters) ----
@@ -2221,17 +2226,102 @@
       });
   }
 
+  // ffmpeg.wasm can only run one exec() at a time per instance, so video
+  // jobs get their own strictly-sequential queue instead of sharing the
+  // image pipeline's concurrency-limited one.
+  var videoQueue = [];
+  var videoBusy = false;
+  function enqueueVideoJob(task) {
+    return new Promise(function (resolve) {
+      videoQueue.push({ task: task, resolve: resolve });
+      pumpVideoQueue();
+    });
+  }
+  function pumpVideoQueue() {
+    if (videoBusy || !videoQueue.length) return;
+    videoBusy = true;
+    var job = videoQueue.shift();
+    Promise.resolve().then(job.task).then(function (result) {
+      videoBusy = false;
+      job.resolve(result);
+      pumpVideoQueue();
+    }, function () {
+      videoBusy = false;
+      job.resolve();
+      pumpVideoQueue();
+    });
+  }
+
+  // Single-threaded core — GitHub Pages can't set the COOP/COEP headers
+  // the multi-threaded core needs for SharedArrayBuffer, so this is the
+  // only build that actually loads on plain static hosting. Loaded lazily
+  // (~25MB) so pure-image use never pays for it.
+  var ffmpegInstance = null;
+  var ffmpegLoadPromise = null;
+  function loadFFmpeg() {
+    if (ffmpegLoadPromise) return ffmpegLoadPromise;
+    ffmpegLoadPromise = (async function () {
+      var ffmpeg = new window.FFmpegWASM.FFmpeg();
+      var baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+      await ffmpeg.load({
+        coreURL: await window.FFmpegUtil.toBlobURL(baseURL + "/ffmpeg-core.js", "text/javascript"),
+        wasmURL: await window.FFmpegUtil.toBlobURL(baseURL + "/ffmpeg-core.wasm", "application/wasm")
+      });
+      ffmpegInstance = ffmpeg;
+      return ffmpeg;
+    })();
+    return ffmpegLoadPromise;
+  }
+
+  async function convertVideoItem(item) {
+    item.status = "processing";
+    renderRow(item);
+    var inputName = "in_" + item.id + "_" + item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    var outputName = "out_" + item.id + ".mp4";
+    try {
+      var ffmpeg = await loadFFmpeg();
+      var data = await window.FFmpegUtil.fetchFile(item.file);
+      await ffmpeg.writeFile(inputName, data);
+      await ffmpeg.exec(["-i", inputName, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", outputName]);
+      var outData = await ffmpeg.readFile(outputName);
+      try { await ffmpeg.deleteFile(inputName); } catch (e) {}
+      try { await ffmpeg.deleteFile(outputName); } catch (e) {}
+
+      var blob = new Blob([outData.buffer], { type: "video/mp4" });
+      item.outputBlob = blob;
+      item.outputSize = blob.size;
+      item.outputFormat = "mp4";
+      item.status = "done";
+      renderRow(item);
+      updateSummary();
+    } catch (e) {
+      item.status = "error";
+      item.error = "Не удалось сконвертировать видео";
+      renderRow(item);
+      updateSummary();
+    }
+  }
+
+  var VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv", "3gp"];
+  function isVideoFile(f) {
+    if (f.type.indexOf("video/") === 0) return true;
+    var ext = f.name.split(".").pop().toLowerCase();
+    return VIDEO_EXTENSIONS.indexOf(ext) !== -1;
+  }
+
   function addFiles(fileList) {
     var files = Array.prototype.slice.call(fileList).filter(function (f) {
-      return f.type.indexOf("image/") === 0;
+      return f.type.indexOf("image/") === 0 || isVideoFile(f);
     });
     if (!files.length) return;
 
     files.forEach(function (file) {
+      var kind = isVideoFile(file) ? "video" : "image";
       var item = {
         id: nextId++,
         file: file,
         name: file.name,
+        kind: kind,
         originalSize: file.size,
         width: 0,
         height: 0,
@@ -2242,6 +2332,11 @@
         error: ""
       };
       items.push(item);
+
+      if (kind === "video") {
+        enqueueVideoJob(function () { return convertVideoItem(item); });
+        return;
+      }
 
       enqueueJob(function () {
         return createImageBitmap(file).then(function (bitmap) {
@@ -2499,8 +2594,10 @@
     // a finished batch restarts from scratch on every unrelated tweak (or
     // every keystroke while typing a target size), which is slow now that
     // processing is strictly one file at a time.
+    // Video items are already converted on drop and don't use the image
+    // settings panel at all — "Apply" only concerns image files.
     var pending = items.filter(function (item) {
-      return item.lastSettingsKey !== key;
+      return item.kind !== "video" && item.lastSettingsKey !== key;
     });
     var total = pending.length;
     var done = 0;
@@ -2579,7 +2676,10 @@
     var downloadBtn = tr.querySelector(".dl-btn");
     downloadBtn.disabled = item.status !== "done";
     var cmpBtn = tr.querySelector(".cmp-btn");
-    cmpBtn.disabled = item.status !== "done";
+    cmpBtn.disabled = item.status !== "done" || item.kind === "video";
+    cmpBtn.style.display = item.kind === "video" ? "none" : "";
+
+    thumbImg.classList.toggle("thumb-video", item.kind === "video" && !item.thumbSrc);
   }
 
   function renderAll() {
@@ -2610,7 +2710,7 @@
         fileRows.appendChild(tr);
 
         tr.querySelector(".cmp-btn").addEventListener("click", function () {
-          if (item.status !== "done" || !item.outputBlob) return;
+          if (item.status !== "done" || !item.outputBlob || item.kind === "video") return;
           openCompare(item);
         });
         tr.querySelector(".dl-btn").addEventListener("click", function (e) {
@@ -3129,10 +3229,12 @@
      to the batch screen instead of silently discarding all but the first. */
   function handleSingleScreenFiles(fileList) {
     var files = Array.prototype.slice.call(fileList).filter(function (f) {
-      return f.type.indexOf("image/") === 0;
+      return f.type.indexOf("image/") === 0 || isVideoFile(f);
     });
     if (!files.length) return;
-    if (files.length === 1) {
+    // The single-file editor is image-only (canvas-based compare view) —
+    // video always goes to the batch table, same as multiple images.
+    if (files.length === 1 && files[0].type.indexOf("image/") === 0) {
       loadSingleFile(files[0]);
     } else {
       addFiles(files);
